@@ -1,18 +1,14 @@
-ADME.md
-package.json
 {
-  "name": "gemini-vapi-custom-tts",
+  "name": "gemini-tts-vapi",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
+  "main": "index.js",
   "scripts": {
-    "start": "node server.mjs"
-  },
-  "engines": {
-    "node": ">=20"
+    "start": "node index.js"
   },
   "dependencies": {
-    "@google/genai": "^1.0.0",
-    "express": "^4.19.2"
+    "@google/genai": "^0.3.0",
+    "express": "^4.19.2",
+    "wavefile": "^11.0.0"
   }
 }
