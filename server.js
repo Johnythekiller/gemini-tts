@@ -1,21 +1,15 @@
-import crypto from "node:crypto";
 import express from "express";
 import { GoogleGenAI } from "@google/genai";
+import { WaveFile } from "wavefile";
 
 const app = express();
-
 app.use(express.json({ limit: "10mb" }));
 
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
 });
 
-const GEMINI_MODEL =
-  process.env.GEMINI_TTS_MODEL || "gemini-3.1-flash-tts-preview";
-const DEFAULT_VOICE_ID = process.env.GEMINI_TTS_VOICE || "Aoede";
-const DEFAULT_SAMPLE_RATE = Number(process.env.DEFAULT_SAMPLE_RATE || 24000);
-const VALID_SAMPLE_RATES = new Set([8000, 16000, 22050, 24000, 44100]);
-const GEMINI_DEFAULT_SAMPLE_RATE = 24000;
+const GEMINI_RATE = 24000; // Gemini TTS sort toujours du PCM 16-bit mono 24 kHz
 
 app.get("/", (req, res) => {
   res.status(200).send("Gemini 3.1 Flash TTS webhook for Vapi is running.");
@@ -25,129 +19,67 @@ app.get("/tts", (req, res) => {
   res.status(200).send("TTS endpoint alive. Vapi must POST here.");
 });
 
-function sanitizeHeaders(headers) {
-  const redacted = { ...headers };
-  for (const key of Object.keys(redacted)) {
-    if (/authorization|secret|token|api[-_]?key/i.test(key)) {
-      redacted[key] = "[redacted]";
-    }
-  }
-  return redacted;
+// ---------- Resampling propre (avec filtrage anti-aliasing) ----------
+function resamplePcmMono16(inputPcmBuffer, fromRate, toRate) {
+  if (fromRate === toRate) return inputPcmBuffer;
+
+  const samples = new Int16Array(
+    inputPcmBuffer.buffer,
+    inputPcmBuffer.byteOffset,
+    inputPcmBuffer.length / 2
+  );
+
+  const wav = new WaveFile();
+  wav.fromScratch(1, fromRate, "16", samples);
+  wav.toSampleRate(toRate, { method: "sinc" }); // sinc = bonne qualité
+
+  const out = wav.data.samples;
+  return Buffer.isBuffer(out) ? out : Buffer.from(out);
 }
 
-function parseSampleRate(value) {
-  const sampleRate = Number(value);
-  if (!Number.isInteger(sampleRate)) return null;
-  if (!VALID_SAMPLE_RATES.has(sampleRate)) return null;
-  return sampleRate;
+// ---------- Wrapper PCM -> WAV (pour endpoints de debug) ----------
+function pcmToWav(pcmBuffer, sampleRate) {
+  const samples = new Int16Array(
+    pcmBuffer.buffer,
+    pcmBuffer.byteOffset,
+    pcmBuffer.length / 2
+  );
+  const wav = new WaveFile();
+  wav.fromScratch(1, sampleRate, "16", samples);
+  return Buffer.from(wav.toBuffer());
 }
 
-function parseGeminiSampleRate(mimeType) {
-  const match = String(mimeType || "").match(/rate=(\d+)/i);
-  const parsed = match ? Number(match[1]) : null;
-  return Number.isInteger(parsed) && parsed > 0
-    ? parsed
-    : GEMINI_DEFAULT_SAMPLE_RATE;
-}
+// ---------- Génération Gemini ----------
+async function generateGeminiPcm24k(text, voiceId) {
+  const ttsPrompt = `
+Audio Profile:
+A helpful and professional personal assistant.
 
-function buildPrompt(text) {
-  return `# AUDIO PROFILE
-Helpful and professional personal assistant.
+Director's note:
+Style: Empathetic.
+Pace: Rapid Fire.
+Accent: French accent.
+Tone: steady, efficient, and authoritative.
+Voice: ${voiceId}.
 
-### DIRECTOR'S NOTES
-Style: Empathetic, warm, professional, confident.
-Pace: Fast and energetic, with almost no dead air.
-Accent: French speech with a clear, neutral delivery.
-Tone: Steady, efficient, commercially sharp, never robotic.
-Voice character: Breezy, middle pitch, light vocal smile.
+Speaking instructions:
+Speak in French.
+Use a fast, energetic rhythm with almost no dead air.
+Keep sentences short.
+Stay warm, empathetic, and professional.
 
-#### TRANSCRIPT
-${text}`;
-}
+Text:
+${text}
+`;
 
-function pcm16LeBufferToFloat32(inputBuffer) {
-  if (inputBuffer.length % 2 !== 0) {
-    throw new Error(`PCM buffer length is odd: ${inputBuffer.length}`);
-  }
-
-  const samples = new Float32Array(inputBuffer.length / 2);
-  for (let i = 0; i < samples.length; i++) {
-    samples[i] = inputBuffer.readInt16LE(i * 2) / 32768;
-  }
-  return samples;
-}
-
-function float32ToPcm16LeBuffer(samples) {
-  const output = Buffer.allocUnsafe(samples.length * 2);
-  for (let i = 0; i < samples.length; i++) {
-    const clamped = Math.max(-1, Math.min(1, samples[i]));
-    const value = clamped < 0 ? clamped * 32768 : clamped * 32767;
-    output.writeInt16LE(Math.round(value), i * 2);
-  }
-  return output;
-}
-
-function sinc(x) {
-  if (Math.abs(x) < 1e-8) return 1;
-  const pix = Math.PI * x;
-  return Math.sin(pix) / pix;
-}
-
-function hammingWindow(distance, radius) {
-  const normalized = Math.abs(distance) / radius;
-  if (normalized >= 1) return 0;
-  return 0.54 + 0.46 * Math.cos(Math.PI * normalized);
-}
-
-function resamplePcm16Mono(inputBuffer, inputRate, outputRate) {
-  if (inputRate === outputRate) return Buffer.from(inputBuffer);
-
-  const input = pcm16LeBufferToFloat32(inputBuffer);
-  const outputLength = Math.max(1, Math.round(input.length * outputRate / inputRate));
-  const output = new Float32Array(outputLength);
-
-  const ratio = inputRate / outputRate;
-  const radius = 16;
-  const cutoff = 0.96 * Math.min(1, outputRate / inputRate);
-
-  for (let i = 0; i < outputLength; i++) {
-    const center = i * ratio;
-    const left = Math.ceil(center - radius);
-    const right = Math.floor(center + radius);
-
-    let sum = 0;
-    let weightSum = 0;
-
-    for (let j = left; j <= right; j++) {
-      if (j < 0 || j >= input.length) continue;
-
-      const distance = center - j;
-      const weight =
-        cutoff *
-        sinc(cutoff * distance) *
-        hammingWindow(distance, radius);
-
-      sum += input[j] * weight;
-      weightSum += weight;
-    }
-
-    output[i] = weightSum === 0 ? 0 : sum / weightSum;
-  }
-
-  return float32ToPcm16LeBuffer(output);
-}
-
-async function synthesizeWithGemini({ text, voiceId }) {
   const response = await ai.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: [{ parts: [{ text: buildPrompt(text) }] }],
+    model: "gemini-3.1-flash-tts-preview",
+    contents: [{ parts: [{ text: ttsPrompt }] }],
     config: {
       responseModalities: ["AUDIO"],
       speechConfig: {
         voiceConfig: {
-          prebuiltVoiceConfig: {
-            voiceName: voiceId,
-          },
+          prebuiltVoiceConfig: { voiceName: voiceId },
         },
       },
     },
@@ -158,120 +90,133 @@ async function synthesizeWithGemini({ text, voiceId }) {
   );
 
   if (!audioPart) {
-    console.error("No audio returned from Gemini:", JSON.stringify(response, null, 2));
+    console.error(
+      "No audio returned from Gemini:",
+      JSON.stringify(response, null, 2)
+    );
     throw new Error("No audio returned from Gemini");
   }
 
-  const mimeType = audioPart.inlineData?.mimeType || "";
-  const sampleRate = parseGeminiSampleRate(mimeType);
-  const pcm = Buffer.from(audioPart.inlineData.data, "base64");
-
-  return { pcm, sampleRate, mimeType };
+  return Buffer.from(audioPart.inlineData.data, "base64");
 }
 
+// ---------- Handler principal Vapi ----------
 async function handleTTS(req, res) {
-  const requestId = crypto.randomUUID();
-  const startedAt = Date.now();
-
   try {
-    const message = req.body?.message || {};
-    const messageType = message.type || req.body?.type;
-    const text = message.text || req.body?.text;
-    const requestedSampleRate = parseSampleRate(
-      message.sampleRate ?? req.body?.sampleRate ?? DEFAULT_SAMPLE_RATE
-    );
-    const voiceId =
-      req.body?.voice?.voiceId ||
-      req.body?.voiceId ||
-      message.voice?.voiceId ||
-      DEFAULT_VOICE_ID;
-
     console.log("===== VAPI TTS REQUEST =====");
-    console.log("requestId:", requestId);
-    console.log("headers:", JSON.stringify(sanitizeHeaders(req.headers), null, 2));
-    console.log("body:", JSON.stringify(req.body, null, 2));
-    console.log("message.type:", messageType);
-    console.log("message.text:", text);
-    console.log("message.sampleRate:", message.sampleRate);
-    console.log("resolved.sampleRate:", requestedSampleRate);
-    console.log("resolved.voiceId:", voiceId);
+    console.log("Headers:", JSON.stringify(req.headers, null, 2));
+    console.log("Body:", JSON.stringify(req.body, null, 2));
 
-    if (messageType && messageType !== "voice-request") {
+    const message = req.body?.message || {};
+
+    if (message.type && message.type !== "voice-request") {
       return res.status(400).json({
         error: "Invalid message type",
-        received: messageType,
+        received: message.type,
       });
     }
 
-    if (!text || typeof text !== "string" || text.trim().length === 0) {
-      return res.status(400).json({ error: "Missing message.text" });
-    }
+    const text =
+      message.text ||
+      req.body?.text ||
+      "Bonjour, ceci est un test de voix Gemini.";
 
-    if (!requestedSampleRate) {
-      return res.status(400).json({
-        error: "Unsupported or missing sample rate",
-        received: message.sampleRate ?? req.body?.sampleRate,
-        supportedRates: [...VALID_SAMPLE_RATES],
-      });
-    }
-
-    const geminiAudio = await synthesizeWithGemini({
-      text: text.trim(),
-      voiceId,
-    });
-
-    const outputPcm = resamplePcm16Mono(
-      geminiAudio.pcm,
-      geminiAudio.sampleRate,
-      requestedSampleRate
+    const requestedSampleRate = Number(
+      message.sampleRate || req.body?.sampleRate || 16000
     );
 
-    console.log("Gemini mimeType:", geminiAudio.mimeType || "[missing]");
-    console.log("Gemini sample rate:", geminiAudio.sampleRate);
-    console.log("Gemini PCM bytes:", geminiAudio.pcm.length);
-    console.log("Output sample rate:", requestedSampleRate);
-    console.log("Output PCM bytes:", outputPcm.length);
-    console.log("Output duration seconds:", (outputPcm.length / 2 / requestedSampleRate).toFixed(3));
-    console.log("TTS completed ms:", Date.now() - startedAt);
+    const voiceId =
+      req.body?.voice?.voiceId || req.body?.voiceId || "Aoede";
 
-    res.status(200);
+    console.log("Text:", text);
+    console.log("Requested sample rate:", requestedSampleRate);
+    console.log("Voice:", voiceId);
+
+    // 1) Gemini -> PCM 16-bit mono 24 kHz
+    const geminiPcm24k = await generateGeminiPcm24k(text, voiceId);
+    console.log(
+      `Gemini PCM bytes=${geminiPcm24k.length} (~${(
+        geminiPcm24k.length /
+        2 /
+        GEMINI_RATE
+      ).toFixed(2)}s @24kHz)`
+    );
+
+    // 2) Resample propre vers le rate Vapi
+    const outputPcm = resamplePcmMono16(
+      geminiPcm24k,
+      GEMINI_RATE,
+      requestedSampleRate
+    );
+    console.log(
+      `Output PCM bytes=${outputPcm.length} (~${(
+        outputPcm.length /
+        2 /
+        requestedSampleRate
+      ).toFixed(2)}s @${requestedSampleRate}Hz)`
+    );
+
+    // 3) Réponse Vapi : raw PCM 16-bit LE mono, octet-stream
     res.setHeader("Content-Type", "application/octet-stream");
     res.setHeader("Content-Length", outputPcm.length);
-    res.end(outputPcm);
+    res.setHeader("Cache-Control", "no-store");
+    res.status(200).send(outputPcm);
   } catch (error) {
-    console.error("Gemini TTS error:", {
-      requestId,
-      message: error.message,
-      stack: error.stack,
+    console.error("Gemini TTS error:", error);
+    res.status(500).json({
+      error: "Gemini TTS failed",
+      detail: error.message,
     });
-
-    if (!res.headersSent) {
-      res.status(500).json({
-        error: "Gemini TTS failed",
-        requestId,
-        detail: error.message,
-      });
-    }
   }
 }
+
+// ---------- Endpoints de debug ----------
+// GET /debug/gemini.wav?text=...&voice=Aoede
+// -> WAV au sample rate natif Gemini (24 kHz). Confirme que Gemini sort du son propre.
+app.get("/debug/gemini.wav", async (req, res) => {
+  try {
+    const text =
+      req.query.text || "Bonjour Didier, ceci est un test de voix Gemini.";
+    const voiceId = req.query.voice || "Aoede";
+    const pcm = await generateGeminiPcm24k(text, voiceId);
+    const wav = pcmToWav(pcm, GEMINI_RATE);
+    res.setHeader("Content-Type", "audio/wav");
+    res.setHeader("Content-Disposition", 'inline; filename="gemini.wav"');
+    res.status(200).send(wav);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /debug/resampled.wav?text=...&rate=16000
+// -> WAV au rate cible (le PCM resamplé enveloppé dans un WAV).
+// Confirme que le resampler ne casse rien.
+app.get("/debug/resampled.wav", async (req, res) => {
+  try {
+    const text =
+      req.query.text || "Bonjour Didier, ceci est un test de voix Gemini.";
+    const voiceId = req.query.voice || "Aoede";
+    const rate = Number(req.query.rate || 16000);
+    const pcm24 = await generateGeminiPcm24k(text, voiceId);
+    const pcmTarget = resamplePcmMono16(pcm24, GEMINI_RATE, rate);
+    const wav = pcmToWav(pcmTarget, rate);
+    res.setHeader("Content-Type", "audio/wav");
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="gemini-${rate}.wav"`
+    );
+    res.status(200).send(wav);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.post("/", handleTTS);
 app.post("/tts", handleTTS);
 
-app.use((error, req, res, next) => {
-  console.error("Unhandled Express error:", error);
-  if (res.headersSent) return next(error);
-  res.status(400).json({
-    error: "Invalid request",
-    detail: error.message,
-  });
-});
-
 const port = process.env.PORT || 3000;
-
 app.listen(port, () => {
   console.log(`Gemini TTS webhook running on port ${port}`);
-  console.log(`Model: ${GEMINI_MODEL}`);
-  console.log(`Default voice: ${DEFAULT_VOICE_ID}`);
-  console.log(`Fallback sample rate: ${DEFAULT_SAMPLE_RATE}`);
 });
