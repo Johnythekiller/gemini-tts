@@ -1,7 +1,7 @@
 import express from "express";
 import { GoogleGenAI } from "@google/genai";
-import { WaveFile } from "wavefile";
-
+import pkg from "wavefile";
+const { WaveFile } = pkg;
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
