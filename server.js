@@ -1,12 +1,21 @@
+import crypto from "node:crypto";
 import express from "express";
 import { GoogleGenAI } from "@google/genai";
 
 const app = express();
+
 app.use(express.json({ limit: "10mb" }));
 
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
 });
+
+const GEMINI_MODEL =
+  process.env.GEMINI_TTS_MODEL || "gemini-3.1-flash-tts-preview";
+const DEFAULT_VOICE_ID = process.env.GEMINI_TTS_VOICE || "Aoede";
+const DEFAULT_SAMPLE_RATE = Number(process.env.DEFAULT_SAMPLE_RATE || 24000);
+const VALID_SAMPLE_RATES = new Set([8000, 16000, 22050, 24000, 44100]);
+const GEMINI_DEFAULT_SAMPLE_RATE = 24000;
 
 app.get("/", (req, res) => {
   res.status(200).send("Gemini 3.1 Flash TTS webhook for Vapi is running.");
@@ -16,164 +25,253 @@ app.get("/tts", (req, res) => {
   res.status(200).send("TTS endpoint alive. Vapi must POST here.");
 });
 
-// Gemini TTS sort en PCM 16-bit mono 24000 Hz.
-// Vapi demande parfois 8000, 16000, 22050 ou 24000.
-// Il faut absolument matcher le sampleRate demandé.
-function resamplePcm16MonoLinear(inputBuffer, inputRate, outputRate) {
-  if (inputRate === outputRate) return inputBuffer;
-
-  const input = new Int16Array(
-    inputBuffer.buffer,
-    inputBuffer.byteOffset,
-    inputBuffer.length / 2
-  );
-
-  const outputLength = Math.floor(input.length * outputRate / inputRate);
-  const output = new Int16Array(outputLength);
-
-  const ratio = inputRate / outputRate;
-
-  for (let i = 0; i < outputLength; i++) {
-    const pos = i * ratio;
-    const index = Math.floor(pos);
-    const frac = pos - index;
-
-    const sample1 = input[index] || 0;
-    const sample2 = input[index + 1] || sample1;
-
-    output[i] = Math.round(sample1 + (sample2 - sample1) * frac);
+function sanitizeHeaders(headers) {
+  const redacted = { ...headers };
+  for (const key of Object.keys(redacted)) {
+    if (/authorization|secret|token|api[-_]?key/i.test(key)) {
+      redacted[key] = "[redacted]";
+    }
   }
-
-  return Buffer.from(output.buffer);
+  return redacted;
 }
 
-async function handleTTS(req, res) {
-  try {
-    console.log("===== VAPI TTS REQUEST =====");
-    console.log(JSON.stringify(req.body, null, 2));
+function parseSampleRate(value) {
+  const sampleRate = Number(value);
+  if (!Number.isInteger(sampleRate)) return null;
+  if (!VALID_SAMPLE_RATES.has(sampleRate)) return null;
+  return sampleRate;
+}
 
-    const message = req.body?.message || {};
+function parseGeminiSampleRate(mimeType) {
+  const match = String(mimeType || "").match(/rate=(\d+)/i);
+  const parsed = match ? Number(match[1]) : null;
+  return Number.isInteger(parsed) && parsed > 0
+    ? parsed
+    : GEMINI_DEFAULT_SAMPLE_RATE;
+}
 
-    if (message.type && message.type !== "voice-request") {
-      return res.status(400).json({
-        error: "Invalid message type",
-        received: message.type,
-      });
+function buildPrompt(text) {
+  return `# AUDIO PROFILE
+Helpful and professional personal assistant.
+
+### DIRECTOR'S NOTES
+Style: Empathetic, warm, professional, confident.
+Pace: Fast and energetic, with almost no dead air.
+Accent: French speech with a clear, neutral delivery.
+Tone: Steady, efficient, commercially sharp, never robotic.
+Voice character: Breezy, middle pitch, light vocal smile.
+
+#### TRANSCRIPT
+${text}`;
+}
+
+function pcm16LeBufferToFloat32(inputBuffer) {
+  if (inputBuffer.length % 2 !== 0) {
+    throw new Error(`PCM buffer length is odd: ${inputBuffer.length}`);
+  }
+
+  const samples = new Float32Array(inputBuffer.length / 2);
+  for (let i = 0; i < samples.length; i++) {
+    samples[i] = inputBuffer.readInt16LE(i * 2) / 32768;
+  }
+  return samples;
+}
+
+function float32ToPcm16LeBuffer(samples) {
+  const output = Buffer.allocUnsafe(samples.length * 2);
+  for (let i = 0; i < samples.length; i++) {
+    const clamped = Math.max(-1, Math.min(1, samples[i]));
+    const value = clamped < 0 ? clamped * 32768 : clamped * 32767;
+    output.writeInt16LE(Math.round(value), i * 2);
+  }
+  return output;
+}
+
+function sinc(x) {
+  if (Math.abs(x) < 1e-8) return 1;
+  const pix = Math.PI * x;
+  return Math.sin(pix) / pix;
+}
+
+function hammingWindow(distance, radius) {
+  const normalized = Math.abs(distance) / radius;
+  if (normalized >= 1) return 0;
+  return 0.54 + 0.46 * Math.cos(Math.PI * normalized);
+}
+
+function resamplePcm16Mono(inputBuffer, inputRate, outputRate) {
+  if (inputRate === outputRate) return Buffer.from(inputBuffer);
+
+  const input = pcm16LeBufferToFloat32(inputBuffer);
+  const outputLength = Math.max(1, Math.round(input.length * outputRate / inputRate));
+  const output = new Float32Array(outputLength);
+
+  const ratio = inputRate / outputRate;
+  const radius = 16;
+  const cutoff = 0.96 * Math.min(1, outputRate / inputRate);
+
+  for (let i = 0; i < outputLength; i++) {
+    const center = i * ratio;
+    const left = Math.ceil(center - radius);
+    const right = Math.floor(center + radius);
+
+    let sum = 0;
+    let weightSum = 0;
+
+    for (let j = left; j <= right; j++) {
+      if (j < 0 || j >= input.length) continue;
+
+      const distance = center - j;
+      const weight =
+        cutoff *
+        sinc(cutoff * distance) *
+        hammingWindow(distance, radius);
+
+      sum += input[j] * weight;
+      weightSum += weight;
     }
 
-    const text =
-      message.text ||
-      req.body?.text ||
-      "Bonjour, ceci est un test de voix Gemini.";
+    output[i] = weightSum === 0 ? 0 : sum / weightSum;
+  }
 
-    const requestedSampleRate =
-      message.sampleRate ||
-      req.body?.sampleRate ||
-      16000;
+  return float32ToPcm16LeBuffer(output);
+}
 
-    const voiceId =
-      req.body?.voice?.voiceId ||
-      req.body?.voiceId ||
-      "Aoede";
-
-    console.log("Text:", text);
-    console.log("Requested sample rate:", requestedSampleRate);
-    console.log("Voice:", voiceId);
-
-    const ttsPrompt = `
-Audio Profile:
-A helpful and professional personal assistant.
-
-Director's note:
-Style: Empathetic.
-Pace: Rapid Fire.
-Accent: American accent.
-Tone: steady, efficient, and authoritative.
-Voice: Aoede.
-Voice character: breezy, middle pitch.
-
-Speaking instructions:
-Speak in French.
-Use a fast, energetic rhythm with almost no dead air.
-Keep sentences short.
-Stay warm, empathetic, and professional.
-Sound confident, helpful, and commercially sharp.
-Do not sound robotic.
-Do not sound like a call-center script.
-Use a light vocal smile.
-Pause briefly before important questions.
-
-Text:
-${text}
-`;
-
-    const response = await ai.models.generateContent({
-      model: "gemini-3.1-flash-tts-preview",
-      contents: [
-        {
-          parts: [{ text: ttsPrompt }],
-        },
-      ],
-      config: {
-        responseModalities: ["AUDIO"],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: {
-              voiceName: voiceId,
-            },
+async function synthesizeWithGemini({ text, voiceId }) {
+  const response = await ai.models.generateContent({
+    model: GEMINI_MODEL,
+    contents: [{ parts: [{ text: buildPrompt(text) }] }],
+    config: {
+      responseModalities: ["AUDIO"],
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: {
+            voiceName: voiceId,
           },
         },
       },
-    });
+    },
+  });
 
-    const audioPart = response.candidates?.[0]?.content?.parts?.find(
-      (part) => part.inlineData?.data
+  const audioPart = response.candidates?.[0]?.content?.parts?.find(
+    (part) => part.inlineData?.data
+  );
+
+  if (!audioPart) {
+    console.error("No audio returned from Gemini:", JSON.stringify(response, null, 2));
+    throw new Error("No audio returned from Gemini");
+  }
+
+  const mimeType = audioPart.inlineData?.mimeType || "";
+  const sampleRate = parseGeminiSampleRate(mimeType);
+  const pcm = Buffer.from(audioPart.inlineData.data, "base64");
+
+  return { pcm, sampleRate, mimeType };
+}
+
+async function handleTTS(req, res) {
+  const requestId = crypto.randomUUID();
+  const startedAt = Date.now();
+
+  try {
+    const message = req.body?.message || {};
+    const messageType = message.type || req.body?.type;
+    const text = message.text || req.body?.text;
+    const requestedSampleRate = parseSampleRate(
+      message.sampleRate ?? req.body?.sampleRate ?? DEFAULT_SAMPLE_RATE
     );
+    const voiceId =
+      req.body?.voice?.voiceId ||
+      req.body?.voiceId ||
+      message.voice?.voiceId ||
+      DEFAULT_VOICE_ID;
 
-    if (!audioPart) {
-      console.error("No audio returned from Gemini:", JSON.stringify(response, null, 2));
-      return res.status(500).json({
-        error: "No audio returned from Gemini",
+    console.log("===== VAPI TTS REQUEST =====");
+    console.log("requestId:", requestId);
+    console.log("headers:", JSON.stringify(sanitizeHeaders(req.headers), null, 2));
+    console.log("body:", JSON.stringify(req.body, null, 2));
+    console.log("message.type:", messageType);
+    console.log("message.text:", text);
+    console.log("message.sampleRate:", message.sampleRate);
+    console.log("resolved.sampleRate:", requestedSampleRate);
+    console.log("resolved.voiceId:", voiceId);
+
+    if (messageType && messageType !== "voice-request") {
+      return res.status(400).json({
+        error: "Invalid message type",
+        received: messageType,
       });
     }
 
-    // Gemini TTS = PCM 16-bit mono 24000 Hz, sans WAV header.
-    const geminiPcm24k = Buffer.from(audioPart.inlineData.data, "base64");
+    if (!text || typeof text !== "string" || text.trim().length === 0) {
+      return res.status(400).json({ error: "Missing message.text" });
+    }
 
-    // Convertit vers le sampleRate demandé par Vapi.
-    const outputPcm = resamplePcm16MonoLinear(
-      geminiPcm24k,
-      24000,
+    if (!requestedSampleRate) {
+      return res.status(400).json({
+        error: "Unsupported or missing sample rate",
+        received: message.sampleRate ?? req.body?.sampleRate,
+        supportedRates: [...VALID_SAMPLE_RATES],
+      });
+    }
+
+    const geminiAudio = await synthesizeWithGemini({
+      text: text.trim(),
+      voiceId,
+    });
+
+    const outputPcm = resamplePcm16Mono(
+      geminiAudio.pcm,
+      geminiAudio.sampleRate,
       requestedSampleRate
     );
 
-    console.log("Gemini PCM bytes:", geminiPcm24k.length);
-    console.log("Output PCM bytes:", outputPcm.length);
+    console.log("Gemini mimeType:", geminiAudio.mimeType || "[missing]");
+    console.log("Gemini sample rate:", geminiAudio.sampleRate);
+    console.log("Gemini PCM bytes:", geminiAudio.pcm.length);
     console.log("Output sample rate:", requestedSampleRate);
+    console.log("Output PCM bytes:", outputPcm.length);
+    console.log("Output duration seconds:", (outputPcm.length / 2 / requestedSampleRate).toFixed(3));
+    console.log("TTS completed ms:", Date.now() - startedAt);
 
-    // IMPORTANT POUR VAPI:
-    // Pas audio/wav.
-    // Pas audio/L16.
-    // Pas JSON.
-    // Juste raw PCM bytes.
+    res.status(200);
     res.setHeader("Content-Type", "application/octet-stream");
     res.setHeader("Content-Length", outputPcm.length);
-    res.status(200).send(outputPcm);
-
+    res.end(outputPcm);
   } catch (error) {
-    console.error("Gemini TTS error:", error);
-    res.status(500).json({
-      error: "Gemini TTS failed",
-      detail: error.message,
+    console.error("Gemini TTS error:", {
+      requestId,
+      message: error.message,
+      stack: error.stack,
     });
+
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: "Gemini TTS failed",
+        requestId,
+        detail: error.message,
+      });
+    }
   }
 }
 
 app.post("/", handleTTS);
 app.post("/tts", handleTTS);
 
+app.use((error, req, res, next) => {
+  console.error("Unhandled Express error:", error);
+  if (res.headersSent) return next(error);
+  res.status(400).json({
+    error: "Invalid request",
+    detail: error.message,
+  });
+});
+
 const port = process.env.PORT || 3000;
 
 app.listen(port, () => {
   console.log(`Gemini TTS webhook running on port ${port}`);
+  console.log(`Model: ${GEMINI_MODEL}`);
+  console.log(`Default voice: ${DEFAULT_VOICE_ID}`);
+  console.log(`Fallback sample rate: ${DEFAULT_SAMPLE_RATE}`);
 });
