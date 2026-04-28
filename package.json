@@ -2,9 +2,9 @@
   "name": "gemini-tts-vapi",
   "version": "1.0.0",
   "type": "module",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "@google/genai": "^0.3.0",
