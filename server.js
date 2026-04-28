@@ -46,10 +46,7 @@ app.post("/tts", async (req, res) => {
       "Bonjour, ceci est un test de voix Gemini.";
 
     // Vapi envoie souvent sampleRate ici
-    const requestedSampleRate =
-      req.body?.message?.sampleRate ||
-      req.body?.sampleRate ||
-      24000;
+const requestedSampleRate = 24000;
 
     // Dans Vapi, mets Voice ID = Aoede
     const voiceId =
