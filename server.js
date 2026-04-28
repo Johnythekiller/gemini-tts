@@ -2,14 +2,12 @@ import express from "express";
 import { GoogleGenAI } from "@google/genai";
 import pkg from "wavefile";
 const { WaveFile } = pkg;
+
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-});
-
-const GEMINI_RATE = 24000; // Gemini TTS sort toujours du PCM 16-bit mono 24 kHz
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const GEMINI_RATE = 24000;
 
 app.get("/", (req, res) => {
   res.status(200).send("Gemini 3.1 Flash TTS webhook for Vapi is running.");
@@ -19,25 +17,21 @@ app.get("/tts", (req, res) => {
   res.status(200).send("TTS endpoint alive. Vapi must POST here.");
 });
 
-// ---------- Resampling propre (avec filtrage anti-aliasing) ----------
+// ---------- Resampling ----------
 function resamplePcmMono16(inputPcmBuffer, fromRate, toRate) {
   if (fromRate === toRate) return inputPcmBuffer;
-
   const samples = new Int16Array(
     inputPcmBuffer.buffer,
     inputPcmBuffer.byteOffset,
     inputPcmBuffer.length / 2
   );
-
   const wav = new WaveFile();
   wav.fromScratch(1, fromRate, "16", samples);
-  wav.toSampleRate(toRate, { method: "sinc" }); // sinc = bonne qualité
-
+  wav.toSampleRate(toRate, { method: "sinc" });
   const out = wav.data.samples;
   return Buffer.isBuffer(out) ? out : Buffer.from(out);
 }
 
-// ---------- Wrapper PCM -> WAV (pour endpoints de debug) ----------
 function pcmToWav(pcmBuffer, sampleRate) {
   const samples = new Int16Array(
     pcmBuffer.buffer,
@@ -49,64 +43,38 @@ function pcmToWav(pcmBuffer, sampleRate) {
   return Buffer.from(wav.toBuffer());
 }
 
-// ---------- Génération Gemini ----------
-async function generateGeminiPcm24k(text, voiceId) {
+// ---------- Construit la requête Gemini ----------
+function buildGeminiRequest(text, voiceId) {
   const ttsPrompt = `
-Audio Profile:
-A helpful and professional personal assistant.
-
+Audio Profile: helpful and professional personal assistant.
 Director's note:
-Style: Empathetic.
-Pace: Rapid Fire.
-Accent: French accent.
-Tone: steady, efficient, and authoritative.
+Style: Empathetic. Pace: Rapid Fire. Accent: French. Tone: steady, efficient.
 Voice: ${voiceId}.
 
 Speaking instructions:
-Speak in French.
-Use a fast, energetic rhythm with almost no dead air.
-Keep sentences short.
-Stay warm, empathetic, and professional.
+Speak in French. Fast, energetic rhythm with almost no dead air. Short sentences.
+Warm, empathetic, professional. Do not sound robotic.
 
 Text:
 ${text}
 `;
-
-  const response = await ai.models.generateContent({
+  return {
     model: "gemini-3.1-flash-tts-preview",
     contents: [{ parts: [{ text: ttsPrompt }] }],
     config: {
       responseModalities: ["AUDIO"],
       speechConfig: {
-        voiceConfig: {
-          prebuiltVoiceConfig: { voiceName: voiceId },
-        },
+        voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceId } },
       },
     },
-  });
-
-  const audioPart = response.candidates?.[0]?.content?.parts?.find(
-    (part) => part.inlineData?.data
-  );
-
-  if (!audioPart) {
-    console.error(
-      "No audio returned from Gemini:",
-      JSON.stringify(response, null, 2)
-    );
-    throw new Error("No audio returned from Gemini");
-  }
-
-  return Buffer.from(audioPart.inlineData.data, "base64");
+  };
 }
 
-// ---------- Handler principal Vapi ----------
+// ---------- Handler Vapi en STREAMING ----------
 async function handleTTS(req, res) {
+  const t0 = Date.now();
   try {
     console.log("===== VAPI TTS REQUEST =====");
-    console.log("Headers:", JSON.stringify(req.headers, null, 2));
-    console.log("Body:", JSON.stringify(req.body, null, 2));
-
     const message = req.body?.message || {};
 
     if (message.type && message.type !== "voice-request") {
@@ -128,87 +96,101 @@ async function handleTTS(req, res) {
     const voiceId =
       req.body?.voice?.voiceId || req.body?.voiceId || "Aoede";
 
-    console.log("Text:", text);
-    console.log("Requested sample rate:", requestedSampleRate);
-    console.log("Voice:", voiceId);
+    console.log(`[${Date.now() - t0}ms] Text: "${text.slice(0, 80)}..."`);
+    console.log(`[${Date.now() - t0}ms] Rate: ${requestedSampleRate}, Voice: ${voiceId}`);
 
-    // 1) Gemini -> PCM 16-bit mono 24 kHz
-    const geminiPcm24k = await generateGeminiPcm24k(text, voiceId);
-    console.log(
-      `Gemini PCM bytes=${geminiPcm24k.length} (~${(
-        geminiPcm24k.length /
-        2 /
-        GEMINI_RATE
-      ).toFixed(2)}s @24kHz)`
-    );
-
-    // 2) Resample propre vers le rate Vapi
-    const outputPcm = resamplePcmMono16(
-      geminiPcm24k,
-      GEMINI_RATE,
-      requestedSampleRate
-    );
-    console.log(
-      `Output PCM bytes=${outputPcm.length} (~${(
-        outputPcm.length /
-        2 /
-        requestedSampleRate
-      ).toFixed(2)}s @${requestedSampleRate}Hz)`
-    );
-
-    // 3) Réponse Vapi : raw PCM 16-bit LE mono, octet-stream
+    // Démarre la réponse HTTP IMMÉDIATEMENT (chunked)
+    res.status(200);
     res.setHeader("Content-Type", "application/octet-stream");
-    res.setHeader("Content-Length", outputPcm.length);
     res.setHeader("Cache-Control", "no-store");
-    res.status(200).send(outputPcm);
+    // Pas de Content-Length -> Node passe automatiquement en Transfer-Encoding: chunked
+
+    // Lance le stream Gemini
+    const stream = await ai.models.generateContentStream(
+      buildGeminiRequest(text, voiceId)
+    );
+    console.log(`[${Date.now() - t0}ms] Gemini stream opened`);
+
+    let totalIn = 0;
+    let totalOut = 0;
+    let firstByteSent = false;
+
+    for await (const chunk of stream) {
+      const part = chunk.candidates?.[0]?.content?.parts?.find(
+        (p) => p.inlineData?.data
+      );
+      if (!part) continue;
+
+      const pcm24 = Buffer.from(part.inlineData.data, "base64");
+      totalIn += pcm24.length;
+
+      const resampled = resamplePcmMono16(
+        pcm24,
+        GEMINI_RATE,
+        requestedSampleRate
+      );
+      totalOut += resampled.length;
+
+      res.write(resampled);
+
+      if (!firstByteSent) {
+        firstByteSent = true;
+        console.log(
+          `[${Date.now() - t0}ms] First audio chunk sent (${resampled.length} bytes)`
+        );
+      }
+    }
+
+    res.end();
+    console.log(
+      `[${Date.now() - t0}ms] Stream done. In=${totalIn}b @24k Out=${totalOut}b @${requestedSampleRate}`
+    );
   } catch (error) {
     console.error("Gemini TTS error:", error);
-    res.status(500).json({
-      error: "Gemini TTS failed",
-      detail: error.message,
-    });
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Gemini TTS failed", detail: error.message });
+    } else {
+      res.end();
+    }
   }
 }
 
-// ---------- Endpoints de debug ----------
-// GET /debug/gemini.wav?text=...&voice=Aoede
-// -> WAV au sample rate natif Gemini (24 kHz). Confirme que Gemini sort du son propre.
+// ---------- Génération non-streaming pour debug ----------
+async function generateGeminiPcm24kFull(text, voiceId) {
+  const response = await ai.models.generateContent(
+    buildGeminiRequest(text, voiceId)
+  );
+  const audioPart = response.candidates?.[0]?.content?.parts?.find(
+    (p) => p.inlineData?.data
+  );
+  if (!audioPart) throw new Error("No audio returned from Gemini");
+  return Buffer.from(audioPart.inlineData.data, "base64");
+}
+
 app.get("/debug/gemini.wav", async (req, res) => {
   try {
-    const text =
-      req.query.text || "Bonjour Didier, ceci est un test de voix Gemini.";
+    const text = req.query.text || "Bonjour Didier, ceci est un test.";
     const voiceId = req.query.voice || "Aoede";
-    const pcm = await generateGeminiPcm24k(text, voiceId);
+    const pcm = await generateGeminiPcm24kFull(text, voiceId);
     const wav = pcmToWav(pcm, GEMINI_RATE);
     res.setHeader("Content-Type", "audio/wav");
-    res.setHeader("Content-Disposition", 'inline; filename="gemini.wav"');
     res.status(200).send(wav);
   } catch (e) {
-    console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// GET /debug/resampled.wav?text=...&rate=16000
-// -> WAV au rate cible (le PCM resamplé enveloppé dans un WAV).
-// Confirme que le resampler ne casse rien.
 app.get("/debug/resampled.wav", async (req, res) => {
   try {
-    const text =
-      req.query.text || "Bonjour Didier, ceci est un test de voix Gemini.";
+    const text = req.query.text || "Bonjour Didier, ceci est un test.";
     const voiceId = req.query.voice || "Aoede";
     const rate = Number(req.query.rate || 16000);
-    const pcm24 = await generateGeminiPcm24k(text, voiceId);
+    const pcm24 = await generateGeminiPcm24kFull(text, voiceId);
     const pcmTarget = resamplePcmMono16(pcm24, GEMINI_RATE, rate);
     const wav = pcmToWav(pcmTarget, rate);
     res.setHeader("Content-Type", "audio/wav");
-    res.setHeader(
-      "Content-Disposition",
-      `inline; filename="gemini-${rate}.wav"`
-    );
     res.status(200).send(wav);
   } catch (e) {
-    console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
